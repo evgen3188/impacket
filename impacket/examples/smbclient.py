@@ -20,6 +20,9 @@ import time
 import cmd
 import os
 import ntpath
+import re
+import io
+import subprocess
 
 from six import PY2
 from impacket.dcerpc.v5 import samr, transport, srvs
@@ -87,10 +90,10 @@ class MiniImpacketShell(cmd.Cmd):
             self.shell.close()
         return True
 
-    def do_shell(self, line):
-        output = os.popen(line).read()
-        print(output)
-        self.last_output = output
+    # def do_shell(self, line):
+    #     output = os.popen(line).read()
+    #     print(output)
+    #     self.last_output = output
 
     def do_help(self,line):
         print("""
@@ -111,6 +114,7 @@ class MiniImpacketShell(cmd.Cmd):
  rmdir {dirname} - removes the directory under the current path
  put {filename} - uploads the filename into the current path
  get {filename} - downloads the filename from the current path
+ mget {glob} - downloads (non-recursively) all filename matched {glob} from the current path
  mount {target,path} - creates a mount point from {path} to {target} (admin required)
  umount {path} - removes the mount point at {path} without deleting the directory (admin required)
  info - returns NetrServerInfo main results
@@ -328,6 +332,8 @@ class MiniImpacketShell(cmd.Cmd):
         self.do_ls('', False)
 
     def complete_cd(self, text, line, begidx, endidx):
+        if not self.completion:
+            self.do_ls('', False)
         return self.complete_get(text, line, begidx, endidx, include = 2)
 
     def do_cd(self, line):
@@ -346,6 +352,7 @@ class MiniImpacketShell(cmd.Cmd):
             fid = self.smb.openFile(self.tid, self.pwd, creationOption = FILE_DIRECTORY_FILE, desiredAccess = FILE_READ_DATA |
                                    FILE_LIST_DIRECTORY, shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE )
             self.smb.closeFile(self.tid,fid)
+            self.completion = []
         except SessionError:
             self.pwd = oldpwd
             raise
@@ -382,8 +389,9 @@ class MiniImpacketShell(cmd.Cmd):
                 print("%crw-rw-rw- %10d  %s %s" % (
                 'd' if f.is_directory() > 0 else '-', f.get_filesize(), time.ctime(float(f.get_mtime_epoch())),
                 f.get_longname()))
+            if f.get_longname() == '.' or f.get_longname() == '..':
+                continue
             self.completion.append((f.get_longname(), f.is_directory()))
-
 
     def do_rm(self, filename):
         if self.tid is None:
@@ -458,6 +466,93 @@ class MiniImpacketShell(cmd.Cmd):
             os.remove(filename)
             raise
         fh.close()
+
+    def _get_files(self):
+        if self.loggedIn is False:
+            LOG.error("Not logged in")
+            return
+        if self.tid is None:
+            LOG.error("No share selected")
+            return
+
+        pwd = ntpath.join(self.pwd, '*')
+        pwd = pwd.replace('/', '\\')
+        pwd = ntpath.normcase(pwd)
+
+        files = []
+        for f in self.smb.listPath(self.share, pwd):
+            if not f.is_directory():
+                files.append(f.get_longname())
+
+        return files
+
+    def do_mget(self, glob_name):
+        if self.tid is None:
+            LOG.error("No share selected")
+            return
+
+        glob_name = glob_name.replace('*', '.*').replace('?', '.?')
+        regex = re.compile(glob_name, re.IGNORECASE)
+        mget_files = self._get_files()
+        for filename in mget_files:
+            if re.match(regex, filename):
+                print('Getting {} ...'.format(filename), end='')
+                fn = filename.replace('/', '\\')
+                fh = open(ntpath.basename(fn), 'wb')
+                pathname = ntpath.join(self.pwd, fn)
+                try:
+                    self.smb.getFile(self.share, pathname, fh.write, FILE_SHARE_READ | FILE_SHARE_WRITE)
+                except:
+                    fh.close()
+                    os.remove(fn)
+                    raise
+                print('OK')
+
+    def complete_shell(self, text, line, begidx, endidx, include = 1):
+        if line[begidx - 1] != '%':
+            return []
+        if not self.completion:
+            self.do_ls('', False)
+        return self.complete_get(text, line, begidx, endidx)
+
+    def do_shell(self, line):
+        if self.tid is None:
+            LOG.error("No share selected")
+            return
+
+        parts = re.sub('\s+', ' ', line).split(' ')
+        if not parts:
+            return
+
+        filename = None
+        if len(parts) == 1:
+            shellcmd = line
+        else:
+            if parts[-1].startswith('%'):
+                filename = parts[-1].lstrip('%').replace('/', '\\')
+                shellcmd = ' '.join(parts[:-1])
+            else:
+                shellcmd = line
+
+        pipe = io.BytesIO()
+        if filename is not None:
+            pathname = ntpath.join(self.pwd, filename)
+            self.smb.getFile(self.share, pathname, pipe.write)
+            pipe.seek(0)
+
+        proc = subprocess.Popen(
+            shellcmd,
+            shell=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        (stdout_value, stderr_value) = proc.communicate(io.TextIOWrapper(pipe, encoding='utf-8').read())
+        if proc.returncode != 0:
+            raise Exception('Error during execution cat:\n{}'.format(stderr_value))
+
+        print(stdout_value)
 
     def do_close(self, line):
         self.do_logoff(line)

@@ -76,6 +76,16 @@ def main():
         password = password + '@' + address.rpartition('@')[0]
         address = address.rpartition('@')[2]
 
+    share = None
+    cdpath = None
+    if '/' in address:
+        parts = address.split('/')
+        address = parts[0]
+        share = parts[1]
+        if not share.endswith('$'):
+            share = share + '$'
+        cdpath = '\\'.join(parts[2:]) if len(parts) > 2 else None
+
     if options.target_ip is None:
         options.target_ip = address
 
@@ -103,6 +113,10 @@ def main():
             smbClient.login(username, password, domain, lmhash, nthash)
 
         shell = MiniImpacketShell(smbClient)
+        if share:
+            shell.do_use(share)
+            if cdpath:
+                shell.do_cd(cdpath)
 
         if options.file is not None:
             logging.info("Executing commands from %s" % options.file.name)
